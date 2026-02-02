@@ -473,7 +473,7 @@ export async function registerRoutes(
     const tools = pluginRegistry.getAllPlugins()
       .filter(p => enabledTypes.includes(p.capabilityType))
       .map(p => ({
-        name: `${p.capabilityType}_${p.id}`,
+        name: `switchboard.${p.capabilityType}.${p.id.replace(/:/g, '-')}`,
         description: `${p.displayName} - Plugin capability for ${p.capabilityType}`,
         inputSchema: {
           type: 'object' as const,
@@ -517,7 +517,8 @@ export async function registerRoutes(
         });
       }
       
-      const [capType] = name.split('_');
+      const nameParts = name.split('.');
+      const capType = nameParts.length >= 2 ? nameParts[1] : name;
       
       const capabilities = await storage.getCapabilities(agentId);
       const cap = capabilities.find(c => c.type === capType);
