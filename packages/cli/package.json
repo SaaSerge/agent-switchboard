@@ -1,0 +1,25 @@
+{
+  "name": "agent-switchboard",
+  "version": "0.1.0",
+  "description": "CLI for scaffolding Agent Switchboard projects",
+  "type": "module",
+  "bin": {
+    "agent-switchboard": "./dist/cli.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "keywords": ["agent", "ai", "switchboard", "cli", "scaffolding"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SaaSerge/agent-switchboard.git",
+    "directory": "packages/cli"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.27",
+    "typescript": "^5.6.3"
+  }
+}
