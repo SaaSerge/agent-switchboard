@@ -1,10 +1,11 @@
 import { db } from "./db";
 import {
   users, agents, agentCapabilities, settings, actionRequests, plans, approvals, executionReceipts, auditEvents,
+  agentMetrics, rateLimits, rateLimitUsage,
   type User, type Agent, type AgentCapability, type ActionRequest, type Plan, type ExecutionReceipt, type AuditEvent,
-  type InsertUser, type CreateAgentRequest
+  type InsertUser, type CreateAgentRequest, type AgentMetric, type RateLimit, type RateLimitUsage
 } from "@shared/schema";
-import { eq, desc, and } from "drizzle-orm";
+import { eq, desc, and, gte, sql } from "drizzle-orm";
 
 export interface IStorage {
   // User/Admin
@@ -47,6 +48,17 @@ export interface IStorage {
   createAuditEvent(event: Partial<AuditEvent>): Promise<void>;
   getAuditEvents(): Promise<AuditEvent[]>;
   getLastAuditEvent(): Promise<AuditEvent | undefined>;
+
+  // Agent Metrics
+  getAgentMetrics(agentId: number, days?: number): Promise<AgentMetric[]>;
+  getAllAgentMetrics(days?: number): Promise<AgentMetric[]>;
+  incrementMetric(agentId: number, field: 'requestsTotal' | 'requestsApproved' | 'requestsRejected' | 'requestsExecuted' | 'requestsFailed', riskScore?: number): Promise<void>;
+
+  // Rate Limits
+  getRateLimit(agentId: number): Promise<RateLimit | undefined>;
+  upsertRateLimit(agentId: number, limits: Partial<RateLimit>): Promise<RateLimit>;
+  checkRateLimit(agentId: number): Promise<{ allowed: boolean; remaining: { minute: number; hour: number; day: number } }>;
+  incrementRateLimitUsage(agentId: number): Promise<void>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -198,6 +210,149 @@ export class DatabaseStorage implements IStorage {
   async getLastAuditEvent(): Promise<AuditEvent | undefined> {
     const [last] = await db.select().from(auditEvents).orderBy(desc(auditEvents.id)).limit(1);
     return last;
+  }
+
+  // Agent Metrics
+  async getAgentMetrics(agentId: number, days: number = 30): Promise<AgentMetric[]> {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - days);
+    const cutoffStr = cutoffDate.toISOString().split('T')[0];
+    
+    return db.select().from(agentMetrics)
+      .where(and(eq(agentMetrics.agentId, agentId), gte(agentMetrics.date, cutoffStr)))
+      .orderBy(desc(agentMetrics.date));
+  }
+
+  async getAllAgentMetrics(days: number = 30): Promise<AgentMetric[]> {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - days);
+    const cutoffStr = cutoffDate.toISOString().split('T')[0];
+    
+    return db.select().from(agentMetrics)
+      .where(gte(agentMetrics.date, cutoffStr))
+      .orderBy(desc(agentMetrics.date));
+  }
+
+  async incrementMetric(
+    agentId: number, 
+    field: 'requestsTotal' | 'requestsApproved' | 'requestsRejected' | 'requestsExecuted' | 'requestsFailed',
+    riskScore?: number
+  ): Promise<void> {
+    const today = new Date().toISOString().split('T')[0];
+    
+    const [existing] = await db.select().from(agentMetrics)
+      .where(and(eq(agentMetrics.agentId, agentId), eq(agentMetrics.date, today)));
+    
+    if (existing) {
+      const updates: any = {};
+      updates[field] = (existing as any)[field] + 1;
+      
+      if (riskScore !== undefined && field === 'requestsTotal') {
+        const total = existing.requestsTotal || 0;
+        const currentAvg = existing.avgRiskScore || 0;
+        updates.avgRiskScore = Math.round((currentAvg * total + riskScore) / (total + 1));
+      }
+      
+      await db.update(agentMetrics).set(updates).where(eq(agentMetrics.id, existing.id));
+    } else {
+      const newMetric: any = {
+        agentId,
+        date: today,
+        requestsTotal: 0,
+        requestsApproved: 0,
+        requestsRejected: 0,
+        requestsExecuted: 0,
+        requestsFailed: 0,
+        avgRiskScore: riskScore || 0,
+      };
+      newMetric[field] = 1;
+      await db.insert(agentMetrics).values(newMetric);
+    }
+  }
+
+  // Rate Limits
+  async getRateLimit(agentId: number): Promise<RateLimit | undefined> {
+    const [limit] = await db.select().from(rateLimits).where(eq(rateLimits.agentId, agentId));
+    return limit;
+  }
+
+  async upsertRateLimit(agentId: number, limits: Partial<RateLimit>): Promise<RateLimit> {
+    const existing = await this.getRateLimit(agentId);
+    
+    if (existing) {
+      const [updated] = await db.update(rateLimits)
+        .set(limits)
+        .where(eq(rateLimits.agentId, agentId))
+        .returning();
+      return updated;
+    } else {
+      const [created] = await db.insert(rateLimits)
+        .values({ agentId, ...limits })
+        .returning();
+      return created;
+    }
+  }
+
+  async checkRateLimit(agentId: number): Promise<{ allowed: boolean; remaining: { minute: number; hour: number; day: number } }> {
+    const limit = await this.getRateLimit(agentId);
+    
+    if (!limit || !limit.enabled) {
+      return { allowed: true, remaining: { minute: -1, hour: -1, day: -1 } };
+    }
+    
+    const now = new Date();
+    const minuteStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes());
+    const hourStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours());
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    
+    const usages = await db.select().from(rateLimitUsage)
+      .where(eq(rateLimitUsage.agentId, agentId));
+    
+    let minuteCount = 0, hourCount = 0, dayCount = 0;
+    
+    for (const usage of usages) {
+      const windowStart = new Date(usage.windowStart);
+      if (usage.windowType === 'minute' && windowStart >= minuteStart) minuteCount = usage.count || 0;
+      if (usage.windowType === 'hour' && windowStart >= hourStart) hourCount = usage.count || 0;
+      if (usage.windowType === 'day' && windowStart >= dayStart) dayCount = usage.count || 0;
+    }
+    
+    const minuteRemaining = (limit.requestsPerMinute || 60) - minuteCount;
+    const hourRemaining = (limit.requestsPerHour || 1000) - hourCount;
+    const dayRemaining = (limit.requestsPerDay || 10000) - dayCount;
+    
+    const allowed = minuteRemaining > 0 && hourRemaining > 0 && dayRemaining > 0;
+    
+    return { allowed, remaining: { minute: minuteRemaining, hour: hourRemaining, day: dayRemaining } };
+  }
+
+  async incrementRateLimitUsage(agentId: number): Promise<void> {
+    const now = new Date();
+    const minuteStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes());
+    const hourStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours());
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    
+    for (const [windowType, windowStart] of [['minute', minuteStart], ['hour', hourStart], ['day', dayStart]] as const) {
+      const [existing] = await db.select().from(rateLimitUsage)
+        .where(and(
+          eq(rateLimitUsage.agentId, agentId),
+          eq(rateLimitUsage.windowType, windowType),
+          eq(rateLimitUsage.windowStart, windowStart)
+        ));
+      
+      if (existing) {
+        await db.update(rateLimitUsage)
+          .set({ count: (existing.count || 0) + 1 })
+          .where(eq(rateLimitUsage.id, existing.id));
+      } else {
+        await db.insert(rateLimitUsage).values({
+          agentId,
+          windowType,
+          windowStart,
+          count: 1,
+        });
+      }
+    }
   }
 }
 

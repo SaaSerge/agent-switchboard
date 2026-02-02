@@ -212,7 +212,7 @@ export async function registerRoutes(
   app.patch(api.agents.toggleCapability.path, requireAdmin, async (req, res) => {
     try {
       const id = Number(req.params.id);
-      const type = req.params.type;
+      const type = req.params.type as string;
       const { enabled, config } = api.agents.toggleCapability.input.parse(req.body);
 
       const capability = await storage.upsertCapability(id, type, enabled, config);
@@ -232,7 +232,7 @@ export async function registerRoutes(
 
   app.put(api.settings.update.path, requireAdmin, async (req, res) => {
     try {
-      const key = req.params.key;
+      const key = req.params.key as string;
       const { value } = api.settings.update.input.parse(req.body);
       await storage.updateSetting(key, value);
 
@@ -328,6 +328,8 @@ export async function registerRoutes(
         return res.status(404).json({ message: "Plan not found" });
       }
 
+      const request = await storage.getRequest(plan.requestId);
+
       await storage.createApproval({
         planId: id,
         approvedBy: req.session.userId!,
@@ -337,6 +339,11 @@ export async function registerRoutes(
 
       const newStatus = decision === "approved" ? "approved" : "rejected";
       await storage.updateRequestStatus(plan.requestId, newStatus);
+
+      if (request) {
+        const metricField = decision === "approved" ? 'requestsApproved' : 'requestsRejected';
+        await storage.incrementMetric(request.agentId, metricField, plan.riskScore || undefined);
+      }
 
       await createAuditEvent("PLAN_" + decision.toUpperCase(), {
         planId: id,
@@ -354,6 +361,210 @@ export async function registerRoutes(
     res.json(events);
   });
 
+  // === METRICS ROUTES ===
+  app.get(api.metrics.list.path, requireAdmin, async (req, res) => {
+    const days = parseInt(req.query.days as string) || 30;
+    const metrics = await storage.getAllAgentMetrics(days);
+    res.json(metrics);
+  });
+
+  app.get(api.metrics.byAgent.path, requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    const days = parseInt(req.query.days as string) || 30;
+    const metrics = await storage.getAgentMetrics(id, days);
+    res.json(metrics);
+  });
+
+  app.get(api.metrics.summary.path, requireAdmin, async (req, res) => {
+    const allAgents = await storage.getAgents();
+    const metrics = await storage.getAllAgentMetrics(30);
+    
+    let totalRequests = 0, totalApproved = 0, totalExecuted = 0, totalFailed = 0;
+    let riskScoreSum = 0, riskScoreCount = 0;
+    
+    const byAgentMap = new Map<number, { total: number; approved: number; executed: number; failed: number; riskSum: number; riskCount: number }>();
+    
+    for (const m of metrics) {
+      totalRequests += m.requestsTotal || 0;
+      totalApproved += m.requestsApproved || 0;
+      totalExecuted += m.requestsExecuted || 0;
+      totalFailed += m.requestsFailed || 0;
+      if (m.avgRiskScore && m.requestsTotal) {
+        riskScoreSum += m.avgRiskScore * m.requestsTotal;
+        riskScoreCount += m.requestsTotal;
+      }
+      
+      const existing = byAgentMap.get(m.agentId) || { total: 0, approved: 0, executed: 0, failed: 0, riskSum: 0, riskCount: 0 };
+      existing.total += m.requestsTotal || 0;
+      existing.approved += m.requestsApproved || 0;
+      existing.executed += m.requestsExecuted || 0;
+      existing.failed += m.requestsFailed || 0;
+      if (m.avgRiskScore && m.requestsTotal) {
+        existing.riskSum += m.avgRiskScore * m.requestsTotal;
+        existing.riskCount += m.requestsTotal;
+      }
+      byAgentMap.set(m.agentId, existing);
+    }
+    
+    const byAgent = allAgents.map(agent => {
+      const data = byAgentMap.get(agent.id) || { total: 0, approved: 0, executed: 0, failed: 0, riskSum: 0, riskCount: 0 };
+      return {
+        agentId: agent.id,
+        agentName: agent.name,
+        totalRequests: data.total,
+        approvalRate: data.total > 0 ? Math.round((data.approved / data.total) * 100) : 0,
+        successRate: data.executed + data.failed > 0 ? Math.round((data.executed / (data.executed + data.failed)) * 100) : 0,
+        avgRiskScore: data.riskCount > 0 ? Math.round(data.riskSum / data.riskCount) : 0,
+      };
+    });
+    
+    res.json({
+      totalRequests,
+      approvalRate: totalRequests > 0 ? Math.round((totalApproved / totalRequests) * 100) : 0,
+      executionSuccessRate: totalExecuted + totalFailed > 0 ? Math.round((totalExecuted / (totalExecuted + totalFailed)) * 100) : 0,
+      avgRiskScore: riskScoreCount > 0 ? Math.round(riskScoreSum / riskScoreCount) : 0,
+      byAgent,
+    });
+  });
+
+  // === RATE LIMIT ROUTES ===
+  app.get(api.rateLimits.get.path, requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    const limit = await storage.getRateLimit(id);
+    
+    if (!limit) {
+      return res.json({
+        agentId: id,
+        requestsPerMinute: 60,
+        requestsPerHour: 1000,
+        requestsPerDay: 10000,
+        enabled: false,
+      });
+    }
+    
+    res.json(limit);
+  });
+
+  app.put(api.rateLimits.set.path, requireAdmin, async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      const updates = api.rateLimits.set.input.parse(req.body);
+      
+      const limit = await storage.upsertRateLimit(id, updates);
+      
+      await createAuditEvent("RATE_LIMIT_UPDATED", { agentId: id, ...updates });
+      
+      res.json(limit);
+    } catch (e: any) {
+      res.status(400).json({ message: e.message });
+    }
+  });
+
+  // === MCP (Model Context Protocol) ROUTES ===
+  app.post(api.mcp.listTools.path, async (req, res) => {
+    const agentId = await authenticateAgent(req);
+    if (!agentId) {
+      return res.status(401).json({ message: "Invalid or missing API key" });
+    }
+
+    const capabilities = await storage.getCapabilities(agentId);
+    const enabledTypes = capabilities.filter(c => c.enabled).map(c => c.type);
+    
+    const tools = pluginRegistry.getAllPlugins()
+      .filter(p => enabledTypes.includes(p.capabilityType))
+      .map(p => ({
+        name: `${p.capabilityType}_${p.id}`,
+        description: `${p.displayName} - Plugin capability for ${p.capabilityType}`,
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            operation: { type: 'string', description: 'The operation to perform' },
+            params: { type: 'object', description: 'Operation parameters' },
+            reasoning: { 
+              type: 'object',
+              description: 'Optional reasoning trace explaining why this action is needed',
+              properties: {
+                goal: { type: 'string' },
+                steps: { type: 'array', items: { type: 'object' } },
+                confidence: { type: 'number' },
+              },
+            },
+          },
+          required: ['operation', 'params'],
+        },
+      }));
+    
+    res.json({ tools });
+  });
+
+  app.post(api.mcp.callTool.path, async (req, res) => {
+    const agentId = await authenticateAgent(req);
+    if (!agentId) {
+      return res.status(401).json({ 
+        content: [{ type: 'text', text: 'Unauthorized: Invalid or missing API key' }],
+        isError: true,
+      });
+    }
+
+    try {
+      const { name, arguments: args } = api.mcp.callTool.input.parse(req.body);
+      
+      const rateLimitCheck = await storage.checkRateLimit(agentId);
+      if (!rateLimitCheck.allowed) {
+        return res.status(429).json({
+          content: [{ type: 'text', text: `Rate limit exceeded. Remaining: minute=${rateLimitCheck.remaining.minute}, hour=${rateLimitCheck.remaining.hour}, day=${rateLimitCheck.remaining.day}` }],
+          isError: true,
+        });
+      }
+      
+      const [capType] = name.split('_');
+      
+      const capabilities = await storage.getCapabilities(agentId);
+      const cap = capabilities.find(c => c.type === capType);
+      if (!cap || !cap.enabled) {
+        return res.json({
+          content: [{ type: 'text', text: `Capability '${capType}' is not enabled for this agent` }],
+          isError: true,
+        });
+      }
+
+      const request = await storage.createRequest({
+        agentId,
+        status: "pending",
+        summary: `MCP:${name}:${args.operation}`,
+        input: { type: capType, operation: args.operation, params: args.params },
+        reasoningTrace: args.reasoning || null,
+        createdAt: new Date(),
+      });
+
+      await storage.incrementMetric(agentId, 'requestsTotal');
+      await storage.incrementRateLimitUsage(agentId);
+
+      await createAuditEvent("MCP_REQUEST_CREATED", { 
+        requestId: request.id, 
+        agentId, 
+        tool: name,
+        hasReasoning: !!args.reasoning,
+      });
+
+      res.json({
+        content: [{ 
+          type: 'text', 
+          text: JSON.stringify({ 
+            requestId: request.id, 
+            status: 'pending',
+            message: 'Action request created. Use dry-run endpoint to generate plan, then await approval before execution.',
+          }),
+        }],
+      });
+    } catch (e: any) {
+      res.json({
+        content: [{ type: 'text', text: `Error: ${e.message}` }],
+        isError: true,
+      });
+    }
+  });
+
   app.post(api.agentApi.createRequest.path, async (req, res) => {
     const agentId = await authenticateAgent(req);
     if (!agentId) {
@@ -362,6 +573,13 @@ export async function registerRoutes(
 
     try {
       const input = api.agentApi.createRequest.input.parse(req.body);
+      
+      const rateLimitCheck = await storage.checkRateLimit(agentId);
+      if (!rateLimitCheck.allowed) {
+        return res.status(429).json({ 
+          message: `Rate limit exceeded. Remaining: minute=${rateLimitCheck.remaining.minute}, hour=${rateLimitCheck.remaining.hour}, day=${rateLimitCheck.remaining.day}` 
+        });
+      }
       
       const capabilities = await storage.getCapabilities(agentId);
       const cap = capabilities.find(c => c.type === input.type);
@@ -374,10 +592,19 @@ export async function registerRoutes(
         status: "pending",
         summary: `${input.type}:${input.operation}`,
         input: input,
+        reasoningTrace: input.reasoning || null,
         createdAt: new Date(),
       });
 
-      await createAuditEvent("REQUEST_CREATED", { requestId: request.id, agentId, type: input.type });
+      await storage.incrementMetric(agentId, 'requestsTotal');
+      await storage.incrementRateLimitUsage(agentId);
+
+      await createAuditEvent("REQUEST_CREATED", { 
+        requestId: request.id, 
+        agentId, 
+        type: input.type,
+        hasReasoning: !!input.reasoning,
+      });
 
       res.status(201).json({ requestId: request.id, status: "pending" });
     } catch (e: any) {
@@ -496,6 +723,9 @@ export async function registerRoutes(
       });
 
       await storage.updateRequestStatus(request.id, hasFailure ? "failed" : "executed");
+      
+      const metricField = hasFailure ? 'requestsFailed' : 'requestsExecuted';
+      await storage.incrementMetric(agentId, metricField);
 
       await createAuditEvent("PLAN_EXECUTED", {
         planId,
@@ -517,6 +747,7 @@ export async function registerRoutes(
       });
 
       await storage.updateRequestStatus(request.id, "failed");
+      await storage.incrementMetric(agentId, 'requestsFailed');
 
       res.status(500).json({
         receiptId: receipt.id,

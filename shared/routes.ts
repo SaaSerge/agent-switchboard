@@ -4,8 +4,10 @@ import {
   insertAgentSchema, 
   insertCapabilitySchema,
   AgentActionSchema,
+  ReasoningTraceSchema,
   insertSettingSchema,
-  users, agents, agentCapabilities, actionRequests, plans, executionReceipts, auditEvents, settings
+  users, agents, agentCapabilities, actionRequests, plans, executionReceipts, auditEvents, settings,
+  agentMetrics, rateLimits
 } from "./schema";
 
 export const errorSchemas = {
@@ -190,6 +192,105 @@ export const api = {
       path: '/api/admin/audit',
       responses: {
         200: z.array(z.custom<typeof auditEvents.$inferSelect>()),
+      },
+    },
+  },
+
+  // === METRICS ===
+  metrics: {
+    list: {
+      method: 'GET' as const,
+      path: '/api/admin/metrics',
+      input: z.object({ days: z.number().optional() }).optional(),
+      responses: {
+        200: z.array(z.custom<typeof agentMetrics.$inferSelect>()),
+      },
+    },
+    byAgent: {
+      method: 'GET' as const,
+      path: '/api/admin/agents/:id/metrics',
+      input: z.object({ days: z.number().optional() }).optional(),
+      responses: {
+        200: z.array(z.custom<typeof agentMetrics.$inferSelect>()),
+      },
+    },
+    summary: {
+      method: 'GET' as const,
+      path: '/api/admin/metrics/summary',
+      responses: {
+        200: z.object({
+          totalRequests: z.number(),
+          approvalRate: z.number(),
+          executionSuccessRate: z.number(),
+          avgRiskScore: z.number(),
+          byAgent: z.array(z.object({
+            agentId: z.number(),
+            agentName: z.string(),
+            totalRequests: z.number(),
+            approvalRate: z.number(),
+            successRate: z.number(),
+            avgRiskScore: z.number(),
+          })),
+        }),
+      },
+    },
+  },
+
+  // === RATE LIMITS ===
+  rateLimits: {
+    get: {
+      method: 'GET' as const,
+      path: '/api/admin/agents/:id/rate-limit',
+      responses: {
+        200: z.custom<typeof rateLimits.$inferSelect>(),
+        404: errorSchemas.notFound,
+      },
+    },
+    set: {
+      method: 'PUT' as const,
+      path: '/api/admin/agents/:id/rate-limit',
+      input: z.object({
+        enabled: z.boolean().optional(),
+        requestsPerMinute: z.number().optional(),
+        requestsPerHour: z.number().optional(),
+        requestsPerDay: z.number().optional(),
+      }),
+      responses: {
+        200: z.custom<typeof rateLimits.$inferSelect>(),
+      },
+    },
+  },
+
+  // === MCP (Model Context Protocol) ===
+  mcp: {
+    listTools: {
+      method: 'POST' as const,
+      path: '/api/mcp/tools/list',
+      responses: {
+        200: z.object({
+          tools: z.array(z.object({
+            name: z.string(),
+            description: z.string(),
+            inputSchema: z.any(),
+          })),
+        }),
+      },
+    },
+    callTool: {
+      method: 'POST' as const,
+      path: '/api/mcp/tools/call',
+      input: z.object({
+        name: z.string(),
+        arguments: z.record(z.any()),
+      }),
+      responses: {
+        200: z.object({
+          content: z.array(z.object({
+            type: z.literal('text'),
+            text: z.string(),
+          })),
+          isError: z.boolean().optional(),
+        }),
       },
     },
   },

@@ -14,6 +14,10 @@ A **local-first control plane** for safely managing AI agents. Provides a web UI
 - **Safe Mode** - Global kill switch that blocks all destructive operations
 - **Emergency Lockdown** - Enables safe mode and rotates all agent API keys instantly
 - **Plugin SDK** - Extensible capability modules (filesystem, shell, network, + custom)
+- **Reasoning Traces** - Agents can provide "show your work" explanations for transparency
+- **MCP Server** - Model Context Protocol compatible endpoints for agentic AI integration
+- **Agent Metrics** - Track success rates, approval rates, and average risk scores per agent
+- **Rate Limiting** - Per-agent request limits (per minute/hour/day) to prevent runaway agents
 
 ## Quick Start
 
@@ -64,11 +68,19 @@ const client = createClient({
   apiKey: 'sk_agent_your_key_here',
 });
 
-// 1. Request an action
+// 1. Request an action with reasoning trace (optional but recommended)
 const { requestId } = await client.requestAction({
   type: 'filesystem',
   operation: 'read',
   params: { path: './sandbox/example.txt' },
+  reasoning: {
+    goal: 'Read configuration file to check current settings',
+    steps: [
+      { thought: 'User asked to check app configuration' },
+      { thought: 'Config is stored in example.txt', action: 'Read file' },
+    ],
+    confidence: 95,
+  },
 });
 
 // 2. Generate dry-run preview
@@ -142,6 +154,9 @@ Configure via the web UI:
 | POST | /api/admin/agents | Create new agent |
 | POST | /api/admin/agents/:id/rotate-key | Rotate agent API key |
 | PATCH | /api/admin/agents/:id/capabilities/:type | Toggle capability |
+| GET | /api/admin/agents/:id/metrics | Get agent metrics |
+| GET | /api/admin/agents/:id/rate-limit | Get agent rate limits |
+| PUT | /api/admin/agents/:id/rate-limit | Set agent rate limits |
 | GET | /api/admin/settings | Get all settings |
 | PUT | /api/admin/settings/:key | Update setting |
 | GET | /api/admin/action-requests | List action requests |
@@ -151,6 +166,8 @@ Configure via the web UI:
 | POST | /api/admin/lockdown | Emergency lockdown |
 | GET | /api/admin/plugins | List loaded plugins |
 | GET | /api/admin/audit | Get audit log |
+| GET | /api/admin/metrics | Get all agent metrics |
+| GET | /api/admin/metrics/summary | Get metrics summary |
 
 ### Agent Endpoints
 
@@ -159,6 +176,13 @@ Configure via the web UI:
 | POST | /api/agent/action-requests | Create action request |
 | POST | /api/agent/action-requests/:id/dry-run | Generate execution plan |
 | POST | /api/agent/plans/:id/execute | Execute approved plan |
+
+### MCP (Model Context Protocol) Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | /api/mcp/tools/list | List available tools for agent |
+| POST | /api/mcp/tools/call | Call a tool (creates action request) |
 
 ## Security Model
 
