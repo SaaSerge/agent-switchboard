@@ -1,0 +1,36 @@
+{
+  "name": "@agent-switchboard/server",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "NODE_ENV=development tsx src/index.ts",
+    "build": "tsc && cp -r ../web/dist ./dist/public 2>/dev/null || true",
+    "start": "NODE_ENV=production node dist/index.js",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@agent-switchboard/shared": "workspace:*",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.6.2",
+    "diff": "^8.0.3",
+    "drizzle-orm": "^0.39.3",
+    "drizzle-zod": "^0.7.0",
+    "express": "^5.0.1",
+    "express-session": "^1.18.1",
+    "memorystore": "^1.6.7",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/diff": "^7.0.2",
+    "@types/express": "^5.0.0",
+    "@types/express-session": "^1.18.0",
+    "@types/node": "^20.19.27",
+    "drizzle-kit": "^0.31.8",
+    "tsx": "^4.20.5",
+    "typescript": "^5.6.3"
+  }
+}
